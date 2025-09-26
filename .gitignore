@@ -1,3 +1,4 @@
 .env
 _pycache_
 *.py[cod]
+oldcode.py
