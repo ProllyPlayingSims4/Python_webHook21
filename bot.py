@@ -11,17 +11,14 @@ load_dotenv()
 # === Config via env vars (fallback defaults only) ===
 API_KEY        = os.getenv("BINANCE_FUTURES_TESTNET_KEY", "")
 API_SECRET_RAW = os.getenv("BINANCE_FUTURES_TESTNET_SECRET", "")
-if not API_SECRET_RAW:
-    # Keep API_SECRET as bytes always
-    API_SECRET = b""
-else:
-    API_SECRET = API_SECRET_RAW.encode()
-
+API_SECRET     = API_SECRET_RAW.encode() if API_SECRET_RAW else b""
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SHARED_SECRET", "")           # shared with TradingView
-DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTCUSDT")                   # only used if alert omits symbol
+
+DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTCUSDT")                   # used if alert omits symbol
 DEFAULT_MARGIN = os.getenv("MARGIN_TYPE", "ISOLATED")             # ISOLATED or CROSSED
 DEFAULT_LEV    = int(os.getenv("LEVERAGE", "3"))                  # fallback leverage
 DEFAULT_NOTION = float(os.getenv("NOTIONAL_USD", "10"))           # fallback notional (USD)
+
 COOLDOWN_SEC   = int(os.getenv("COOLDOWN_SEC", "60"))
 BASE           = os.getenv("BINANCE_BASE", "https://testnet.binancefuture.com")
 TIMEOUT_SEC    = int(os.getenv("TIMEOUT_SEC", "10"))
@@ -57,7 +54,7 @@ def sign(params: Dict[str, Any]) -> str:
     sig = hmac.new(API_SECRET, qs.encode(), hashlib.sha256).hexdigest()
     return f"{qs}&signature={sig}"
 
-# === Time sync & signed requests (fixes -1021) ===
+# === Time sync & signed requests (fixes -1021 / stabilizes -1000) ===
 TIME_OFFSET_MS = 0  # server_time - local_time
 
 def local_ms() -> int:
@@ -193,26 +190,67 @@ def is_hedge_mode() -> bool:
         print("[HEDGE MODE] parse failed:", e, r.text)
         return False
 
-def place_market_order(symbol: str, side: str, qty_str: str):
+def get_account_overview() -> Dict[str, Any]:
+    """Return /fapi/v2/account (balances, permissions)."""
+    r = signed_get("/fapi/v2/account", {})
+    try:
+        return r.json()
+    except Exception:
+        return {"status_code": r.status_code, "text": r.text[:500]}
+
+def get_leverage_brackets(symbol: str) -> Any:
+    r = rget("/fapi/v1/leverageBracket", params={"symbol": symbol})
+    try:
+        return r.json()
+    except Exception:
+        return {"status_code": r.status_code, "text": r.text[:500]}
+
+def test_market_order(symbol: str, side: str, qty_str: str, position_side: str | None):
+    """Preflight: /fapi/v1/order/test — validates params with no fill."""
     params = {
         "symbol": symbol,
-        "side": side,   # BUY or SELL
+        "side": side,
         "type": "MARKET",
         "quantity": qty_str,
     }
-    # If hedge mode is enabled, Binance expects positionSide.
+    if position_side:
+        params["positionSide"] = position_side
+    r = signed_post("/fapi/v1/order/test", params)
+    return r
+
+def place_market_order(symbol: str, side: str, qty_str: str):
+    # Add positionSide in hedge mode
+    position_side = None
     try:
         if is_hedge_mode():
-            params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
+            position_side = "LONG" if side == "BUY" else "SHORT"
     except Exception as e:
         print("[ORDER] hedge mode check failed:", e)
+
+    # Preflight test — catches most param issues cleanly
+    rt = test_market_order(symbol, side, qty_str, position_side)
+    try:
+        print("[ORDER TEST RESP]", rt.status_code, rt.text[:500])
+    except Exception:
+        pass
+    if rt.status_code not in (200, 201):
+        raise HTTPException(500, f"order test failed: {rt.status_code} {rt.text}")
+
+    # Real order
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": qty_str,
+    }
+    if position_side:
+        params["positionSide"] = position_side
 
     r = signed_post("/fapi/v1/order", params)
     try:
         print("[ORDER RESP]", r.status_code, r.text[:500])
     except Exception:
         pass
-
     if r.status_code != 200:
         raise HTTPException(500, f"order failed: {r.status_code} {r.text}")
     return r.json()
@@ -267,7 +305,6 @@ def health():
 
 @app.on_event("startup")
 async def _startup_sync():
-    # sync again on container start
     sync_time()
 
 @app.get("/diag")
@@ -298,6 +335,16 @@ def diag(symbol: str = "BTCUSDT", notional: float = 10.0, leverage: int = 3, mar
         "recvWindow": DEFAULT_RECV_WINDOW,
         "base": BASE,
     }
+
+@app.get("/account")
+def account():
+    """See balances, permissions, and positions from /fapi/v2/account."""
+    return get_account_overview()
+
+@app.get("/bracket")
+def bracket(symbol: str = "BTCUSDT"):
+    """Leverage brackets for a symbol (useful to know max leverage by notional tiers)."""
+    return get_leverage_brackets(symbol)
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -345,8 +392,7 @@ async def webhook(request: Request):
     try:
         set_margin_type(symbol, margin_type)
     except Exception:
-        # ok if already set
-        pass
+        pass  # ok if already set
 
     set_leverage(symbol, leverage)  # raises if invalid for symbol
 
@@ -357,7 +403,7 @@ async def webhook(request: Request):
     if qty == "0":
         raise HTTPException(400, f"Computed quantity < minQty for {symbol}; increase notional_usd")
 
-    # --- Place the order exactly as requested ---
+    # --- Place the order exactly as requested (with test first) ---
     resp = place_market_order(symbol, side, qty)
     LAST_ORDER_TS[k] = now
 
@@ -373,6 +419,7 @@ async def webhook(request: Request):
         "orderId": resp.get("orderId"),
         "executedQty": resp.get("executedQty"),
     }
+
 
 
 
