@@ -155,10 +155,24 @@ async def webhook(request: Request):
             raise HTTPException(401, "Invalid signature")
 
     # --- Parse JSON (TradingView alert) ---
+   # --- Parse JSON (TradingView alert) ---
+     # --- Parse JSON (TradingView alert) ---
     try:
-        payload = TradeSignal(**(await request.json()))
+        # Grab raw body first (for debugging)
+        raw_body = body  # Already awaited above
+        print("DEBUG Raw body:", raw_body.decode("utf-8", errors="replace")[:500])
+
+        # Try JSON parse
+        parsed = await request.json()
+        print("DEBUG Parsed JSON:", parsed)
+
+        payload = TradeSignal(**parsed)
+
     except Exception as e:
-        raise HTTPException(400, f"Invalid JSON payload: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
+
+    #return {"status": "ok"}
+
 
     # Fill from payload or fallback to .env defaults
     symbol       = (payload.symbol or DEFAULT_SYMBOL).upper()
