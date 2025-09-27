@@ -5,21 +5,28 @@ import requests
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, Field, validator
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # === Config via env vars (fallback defaults only) ===
 API_KEY        = os.getenv("BINANCE_FUTURES_TESTNET_KEY", "")
-API_SECRET     = os.getenv("BINANCE_FUTURES_TESTNET_SECRET", "").encode()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SHARED_SECRET", "")        # shared with TradingView
-DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTCUSDT")                # only used if alert omits symbol
-DEFAULT_MARGIN = os.getenv("MARGIN_TYPE", "ISOLATED")          # ISOLATED or CROSSED
-DEFAULT_LEV    = int(os.getenv("LEVERAGE", "3"))               # fallback leverage
-DEFAULT_NOTION = float(os.getenv("NOTIONAL_USD", "10"))        # fallback notional (USD)
+API_SECRET_RAW = os.getenv("BINANCE_FUTURES_TESTNET_SECRET", "")
+if not API_SECRET_RAW:
+    # Keep API_SECRET as bytes always
+    API_SECRET = b""
+else:
+    API_SECRET = API_SECRET_RAW.encode()
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SHARED_SECRET", "")           # shared with TradingView
+DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTCUSDT")                   # only used if alert omits symbol
+DEFAULT_MARGIN = os.getenv("MARGIN_TYPE", "ISOLATED")             # ISOLATED or CROSSED
+DEFAULT_LEV    = int(os.getenv("LEVERAGE", "3"))                  # fallback leverage
+DEFAULT_NOTION = float(os.getenv("NOTIONAL_USD", "10"))           # fallback notional (USD)
 COOLDOWN_SEC   = int(os.getenv("COOLDOWN_SEC", "60"))
 BASE           = os.getenv("BINANCE_BASE", "https://testnet.binancefuture.com")
 TIMEOUT_SEC    = int(os.getenv("TIMEOUT_SEC", "10"))
 MAX_RETRIES    = int(os.getenv("MAX_RETRIES", "6"))
-DEFAULT_RECV_WINDOW = int(os.getenv("RECV_WINDOW_MS", "60000"))  # generous 60s
+DEFAULT_RECV_WINDOW = int(os.getenv("RECV_WINDOW_MS", "60000"))   # generous 60s
 
 # === HTTP Session with retries ===
 SESSION = requests.Session()
@@ -31,7 +38,8 @@ retry = Retry(
     allowed_methods=None, raise_on_status=False
 )
 adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-SESSION.mount("https://", adapter); SESSION.mount("http://", adapter)
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
 
 def headers() -> Dict[str, str]:
     return {"X-MBX-APIKEY": API_KEY}
@@ -49,7 +57,7 @@ def sign(params: Dict[str, Any]) -> str:
     sig = hmac.new(API_SECRET, qs.encode(), hashlib.sha256).hexdigest()
     return f"{qs}&signature={sig}"
 
-# === Time sync & signed POST (fixes -1021) ===
+# === Time sync & signed requests (fixes -1021) ===
 TIME_OFFSET_MS = 0  # server_time - local_time
 
 def local_ms() -> int:
@@ -73,10 +81,32 @@ def sync_time():
 def now_ms_server() -> int:
     return local_ms() + TIME_OFFSET_MS
 
+def signed_get(path: str, params: Dict[str, Any]) -> requests.Response:
+    """Signed GET with timestamp, recvWindow, and 1 retry on -1021/-1000."""
+    def _do(params_):
+        params_["timestamp"] = now_ms_server()
+        params_.setdefault("recvWindow", DEFAULT_RECV_WINDOW)
+        full = f"{path}?{sign(params_)}"
+        return rget(full, headers=headers())
+
+    r = _do(dict(params))
+    try:
+        j = r.json()
+    except Exception:
+        j = None
+
+    if r.status_code in (400, 401) and isinstance(j, dict) and j.get("code") in (-1021, -1000):
+        print("[SIGNED GET] error", j, "— resyncing and retrying once")
+        sync_time()
+        r = _do(dict(params))
+    return r
+
 def signed_post(path: str, params: Dict[str, Any]) -> requests.Response:
     """
-    Adds timestamp & signature, executes POST.
-    On -1021 (timestamp/recvWindow), resyncs time and retries once.
+    Signed POST with timestamp, recvWindow.
+    Retries on:
+      -1021 (timestamp/recvWindow) -> resync & retry
+      -1000 (unknown)             -> brief backoff, resync & up to 2 retries
     """
     def _do(params_):
         params_["timestamp"] = now_ms_server()
@@ -90,10 +120,22 @@ def signed_post(path: str, params: Dict[str, Any]) -> requests.Response:
     except Exception:
         j = None
 
-    if r.status_code in (400, 401) and isinstance(j, dict) and j.get("code") == -1021:
-        print("[SIGNED POST] -1021 detected, resyncing time and retrying once")
+    if r.status_code in (400, 401) and isinstance(j, dict) and j.get("code") in (-1021, -1000):
+        print("[SIGNED POST] error", j, "— handling…")
+        if j.get("code") == -1000:
+            time.sleep(0.25)  # tiny backoff for transient errors
         sync_time()
         r = _do(dict(params))
+        try:
+            j2 = r.json()
+        except Exception:
+            j2 = None
+
+        if r.status_code in (400, 401) and isinstance(j2, dict) and j2.get("code") == -1000:
+            print("[SIGNED POST] persistent -1000, final short backoff & retry")
+            time.sleep(0.5)
+            sync_time()
+            r = _do(dict(params))
     return r
 
 # Initial time sync on import
@@ -138,6 +180,19 @@ def set_leverage(symbol: str, leverage: int):
         raise HTTPException(500, f"leverage failed: {r.status_code} {r.text}")
     return r.json()
 
+def is_hedge_mode() -> bool:
+    """Detect if account is in Hedge Mode (dualSidePosition)."""
+    r = signed_get("/fapi/v1/positionSide/dual", {})
+    if r.status_code != 200:
+        print("[HEDGE MODE] read failed:", r.status_code, r.text)
+        return False
+    try:
+        data = r.json()
+        return bool(data.get("dualSidePosition", False))
+    except Exception as e:
+        print("[HEDGE MODE] parse failed:", e, r.text)
+        return False
+
 def place_market_order(symbol: str, side: str, qty_str: str):
     params = {
         "symbol": symbol,
@@ -145,14 +200,26 @@ def place_market_order(symbol: str, side: str, qty_str: str):
         "type": "MARKET",
         "quantity": qty_str,
     }
+    # If hedge mode is enabled, Binance expects positionSide.
+    try:
+        if is_hedge_mode():
+            params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
+    except Exception as e:
+        print("[ORDER] hedge mode check failed:", e)
+
     r = signed_post("/fapi/v1/order", params)
+    try:
+        print("[ORDER RESP]", r.status_code, r.text[:500])
+    except Exception:
+        pass
+
     if r.status_code != 200:
         raise HTTPException(500, f"order failed: {r.status_code} {r.text}")
     return r.json()
 
 # === App state ===
-FILTERS_CACHE: Dict[str, Tuple[float, float]] = {}      # per-symbol (stepSize, minQty)
-LAST_ORDER_TS: Dict[Tuple[str, str], float] = {}        # cooldown per (symbol, side)
+FILTERS_CACHE: Dict[str, Tuple[float, float]] = {}   # per-symbol (stepSize, minQty)
+LAST_ORDER_TS: Dict[Tuple[str, str], float] = {}     # cooldown per (symbol, side)
 
 app = FastAPI()
 
@@ -191,12 +258,46 @@ class TradeSignal(BaseModel):
 # === Routes ===
 @app.get("/")
 def health():
-    return {"ok": True, "base": BASE, "recvWindow": DEFAULT_RECV_WINDOW, "timeOffsetMs": TIME_OFFSET_MS}
+    return {
+        "ok": True,
+        "base": BASE,
+        "recvWindow": DEFAULT_RECV_WINDOW,
+        "timeOffsetMs": TIME_OFFSET_MS
+    }
 
 @app.on_event("startup")
 async def _startup_sync():
     # sync again on container start
     sync_time()
+
+@app.get("/diag")
+def diag(symbol: str = "BTCUSDT", notional: float = 10.0, leverage: int = 3, margin_type: str = "ISOLATED"):
+    """Preflight: compute filters, price, qty, detect hedge mode; no order is placed."""
+    step, min_qty = get_exchange_filters(symbol)
+    mark = get_mark_price(symbol)
+    raw_qty = max(0.0, notional / mark)
+    qty = snap_qty(raw_qty, step, min_qty)
+    hedge = False
+    try:
+        hedge = is_hedge_mode()
+    except Exception as e:
+        print("[DIAG] hedge mode check failed:", e)
+
+    return {
+        "symbol": symbol,
+        "mark": mark,
+        "stepSize": step,
+        "minQty": min_qty,
+        "notional": notional,
+        "rawQty": raw_qty,
+        "snappedQty": qty,
+        "leverage": leverage,
+        "margin_type": margin_type,
+        "hedge_mode": hedge,
+        "timeOffsetMs": TIME_OFFSET_MS,
+        "recvWindow": DEFAULT_RECV_WINDOW,
+        "base": BASE,
+    }
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -272,6 +373,7 @@ async def webhook(request: Request):
         "orderId": resp.get("orderId"),
         "executedQty": resp.get("executedQty"),
     }
+
 
 
 # import os, hmac, hashlib, time, math, urllib.parse
