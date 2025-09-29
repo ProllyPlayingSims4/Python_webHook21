@@ -198,8 +198,15 @@ def get_account_overview() -> Dict[str, Any]:
     except Exception:
         return {"status_code": r.status_code, "text": r.text[:500]}
 
+# def get_leverage_brackets(symbol: str) -> Any:
+#     r = rget("/fapi/v1/leverageBracket", params={"symbol": symbol})
+#     try:
+#         return r.json()
+#     except Exception:
+#         return {"status_code": r.status_code, "text": r.text[:500]}
 def get_leverage_brackets(symbol: str) -> Any:
-    r = rget("/fapi/v1/leverageBracket", params={"symbol": symbol})
+    # Either signed (safest):
+    r = signed_get("/fapi/v1/leverageBracket", {"symbol": symbol})
     try:
         return r.json()
     except Exception:
