@@ -170,12 +170,51 @@ def set_margin_type(symbol: str, margin_type: str):
         return {"msg": "No need to change margin type."}
     raise HTTPException(500, f"marginType failed: {r.status_code} {r.text}")
 
+# def set_leverage(symbol: str, leverage: int):
+#     params = {"symbol": symbol, "leverage": leverage}
+#     r = signed_post("/fapi/v1/leverage", params)
+#     if r.status_code != 200:
+#         raise HTTPException(500, f"leverage failed: {r.status_code} {r.text}")
+#     return r.json()
+
+def get_current_leverage(symbol: str) -> int | None:
+    r = signed_get("/fapi/v2/positionRisk", {"symbol": symbol})
+    if r.status_code != 200:
+        print("[LEV READ] failed:", r.status_code, r.text[:300])
+        return None
+    try:
+        data = r.json()
+        # positionRisk returns a list; leverage is a string number
+        if isinstance(data, list) and data:
+            return int(float(data[0].get("leverage", "0")))
+    except Exception as e:
+        print("[LEV READ] parse error:", e)
+    return None
+
 def set_leverage(symbol: str, leverage: int):
+    # skip if already set
+    cur = get_current_leverage(symbol)
+    if cur == leverage:
+        return {"leverage": cur, "skipped": True}
+
     params = {"symbol": symbol, "leverage": leverage}
     r = signed_post("/fapi/v1/leverage", params)
-    if r.status_code != 200:
-        raise HTTPException(500, f"leverage failed: {r.status_code} {r.text}")
-    return r.json()
+    if r.status_code == 200:
+        return r.json()
+
+    # One tolerant retry for -1000 after short backoff
+    try:
+        j = r.json()
+    except Exception:
+        j = {}
+    if isinstance(j, dict) and j.get("code") == -1000:
+        time.sleep(0.4)
+        r2 = signed_post("/fapi/v1/leverage", params)
+        if r2.status_code == 200:
+            return r2.json()
+
+    raise HTTPException(500, f"leverage failed: {r.status_code} {r.text}")
+
 
 def is_hedge_mode() -> bool:
     """Detect if account is in Hedge Mode (dualSidePosition)."""
