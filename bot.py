@@ -161,6 +161,69 @@ sync_time()
 
 # ---------- Binance helpers ----------
 
+def get_symbol_filters(symbol: str) -> dict:
+        """
+        Returns {'stepSize': float, 'minQty': float, 'tickSize': float}
+        """
+        r = rget("/fapi/v1/exchangeInfo"); r.raise_for_status()
+        data = r.json()
+        sym = next(s for s in data["symbols"] if s["symbol"] == symbol)
+
+        step_size = 0.0
+        min_qty   = 0.0
+        tick_size = 0.0
+
+        for f in sym["filters"]:
+            ft = f.get("filterType")
+            if ft in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                step_size = float(f["stepSize"])
+                min_qty   = float(f["minQty"])
+            elif ft in ("PRICE_FILTER",):
+                tick_size = float(f["tickSize"])
+        if step_size <= 0 or min_qty <= 0 or tick_size <= 0:
+            raise RuntimeError(f"Missing filters for {symbol}: step={step_size}, minQty={min_qty}, tick={tick_size}")
+        return {"stepSize": step_size, "minQty": min_qty, "tickSize": tick_size}
+
+
+def round_price_for_side(price: float, tick: float, side: str) -> str:
+    # BUY => round UP (so order crosses), SELL => round DOWN
+    if side.upper() == "BUY":
+        p = math.ceil(price / tick) * tick
+    else:
+        p = math.floor(price / tick) * tick
+    s = ("%.10f" % p).rstrip("0").rstrip(".")
+    return s if s else "0"
+
+def ioc_limit_order(symbol: str, side: str, qty_str: str) -> requests.Response:
+    """
+    Place a LIMIT IOC as a fallback when MARKET is flaky on testnet.
+    We price ~+1% for BUY (or -1% for SELL) vs current mark, then IOC.
+    """
+    filters = get_symbol_filters(symbol)
+    mark    = get_mark_price(symbol)
+
+    # Small “slippage” to ensure crossing:
+    slip = 0.010  # 1%
+    if side.upper() == "BUY":
+        px = mark * (1.0 + slip)
+    else:
+        px = mark * (1.0 - slip)
+
+    price_str = round_price_for_side(px, filters["tickSize"], side)
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "LIMIT",
+        "timeInForce": "IOC",
+        "quantity": qty_str,
+        "price": price_str,
+        "newClientOrderId": _rand_id("ioc"),
+        "newOrderRespType": "RESULT",
+    }
+    return signed_post("/fapi/v1/order", params)
+
+
 def get_position_state(symbol: str) -> dict:
     """
     Returns {'isolated': bool|None, 'positionAmt': float|None}
@@ -374,7 +437,7 @@ def _raise_with_diagnosis(where: str, r: requests.Response, extra: Optional[Dict
     raise HTTPException(status_code=400 if r.status_code in (400, 401) else 500, detail=payload)
 
 def place_market_order(symbol: str, side: str, qty_str: str):
-    # Decide positionSide
+    # Decide position side
     position_side = None
     try:
         if is_hedge_mode():
@@ -384,23 +447,21 @@ def place_market_order(symbol: str, side: str, qty_str: str):
     except Exception as e:
         log_json("hedge_mode_check_fail", err=str(e))
 
-    # Preflight
+    # Preflight (MARKET)
     rt = test_market_order(symbol, side, qty_str, None if position_side == "BOTH" else position_side)
     log_json("order_test_resp", status=rt.status_code, body=_safe_json(rt))
     if rt.status_code not in (200, 201):
         _raise_with_diagnosis("order_test", rt, extra={"symbol": symbol, "side": side, "qty": qty_str, "leverage": 0, "margin_type": "?"})
 
-    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty_str, "newClientOrderId": _rand_id("tv")}
+    # Common params
+    base = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty_str, "newOrderRespType": "RESULT"}
     if position_side and position_side != "BOTH":
-        params["positionSide"] = position_side
+        base["positionSide"] = position_side
 
-    # Up to 3 attempts: alternate body/query; resync & backoff on -1000/-1021
-    attempt = 0
-    last_r = None
-    while attempt < 3:
-        attempt += 1
+    # Try MARKET twice (body then query), with a **fresh** clientOrderId each attempt
+    for attempt, mode in enumerate(("body", "query"), start=1):
+        params = dict(base); params["newClientOrderId"] = _rand_id("tv")
         p = _attach_common(params)
-        mode = "body" if attempt % 2 == 1 else "query"
         log_json("order_attempt", attempt=attempt, mode=mode, params=p)
 
         if mode == "body":
@@ -418,15 +479,27 @@ def place_market_order(symbol: str, side: str, qty_str: str):
             return j
 
         code = (j.get("code") if isinstance(j, dict) else None)
+        # Only backoff/retry on testnet flakes -1000/-1021; fail fast otherwise
         if code not in (-1000, -1021):
             _raise_with_diagnosis("order", r, extra={"symbol": symbol, "side": side, "qty": qty_str, "leverage": 0, "margin_type": "?"})
 
-        # backoff + resync before next try
-        time.sleep(0.35 + attempt * 0.15); sync_time()
-        last_r = r
+        time.sleep(0.35 + attempt * 0.15)
+        sync_time()
 
-    # all attempts failed → raise with full diagnosis
-    _raise_with_diagnosis("order", last_r, extra={"symbol": symbol, "side": side, "qty": qty_str, "leverage": 0, "margin_type": "?"})
+    # Fallback → LIMIT IOC (acts like market but more reliable on testnet)
+    log_json("order_fallback_ioc", symbol=symbol, side=side, qty=qty_str)
+    r = ioc_limit_order(symbol, side, qty_str)
+    j = _safe_json(r)
+    log_json("order_fallback_ioc_done", status=r.status_code,
+             code=(j.get("code") if isinstance(j, dict) else None),
+             msg=(j.get("msg") if isinstance(j, dict) else None),
+             headers=_mbx_header_snapshot(r.headers))
+    if r.status_code == 200:
+        return j
+
+    # Still not happy → raise with full diagnosis
+    _raise_with_diagnosis("order", r, extra={"symbol": symbol, "side": side, "qty": qty_str, "leverage": 0, "margin_type": "?"})
+
 
 # ---------- App state ----------
 FILTERS_CACHE: Dict[str, Tuple[float, float]] = {}
