@@ -160,6 +160,82 @@ def signed_post(path: str, params: Dict[str, Any]) -> requests.Response:
 sync_time()
 
 # ---------- Binance helpers ----------
+
+def get_position_state(symbol: str) -> dict:
+    """
+    Returns {'isolated': bool|None, 'positionAmt': float|None}
+    Using /fapi/v2/positionRisk (per-symbol).
+    """
+    r = signed_get("/fapi/v2/positionRisk", {"symbol": symbol})
+    if r.status_code != 200:
+        log_json("position_state_fail", status=r.status_code, body=r.text[:300])
+        return {"isolated": None, "positionAmt": None}
+    try:
+        arr = r.json()
+        if isinstance(arr, list) and arr:
+            iso = bool(arr[0].get("isolated", False))
+            amt = float(arr[0].get("positionAmt", "0") or "0")
+            return {"isolated": iso, "positionAmt": amt}
+    except Exception as e:
+        log_json("position_state_parse_fail", err=str(e))
+    return {"isolated": None, "positionAmt": None}
+
+
+def has_open_orders(symbol: str) -> bool:
+    """
+    Returns True if there are any open orders for the symbol.
+    """
+    r = signed_get("/fapi/v1/openOrders", {"symbol": symbol})
+    if r.status_code != 200:
+        log_json("open_orders_read_fail", status=r.status_code, body=r.text[:300])
+        return False
+    try:
+        data = r.json()
+        return isinstance(data, list) and len(data) > 0
+    except Exception as e:
+        log_json("open_orders_parse_fail", err=str(e))
+        return False
+
+
+def set_margin_type_safe(symbol: str, target: str) -> dict:
+    """
+    Smart margin-type switcher:
+      - Detect current via positionRisk.isolated
+      - Skip if already correct
+      - Skip if there is a position or open orders
+      - Otherwise, attempt change; treat -4046 as OK; treat -1000 as non-fatal
+    """
+    st = get_position_state(symbol)
+    cur_isolated = st["isolated"]
+    pos_amt = st["positionAmt"]
+
+    want_isolated = (target.upper() == "ISOLATED")
+
+    # If we can detect current and it already matches, skip
+    if cur_isolated is not None and cur_isolated == want_isolated:
+        log_json("margin_type_skip_already", symbol=symbol, current=("ISOLATED" if cur_isolated else "CROSSED"))
+        return {"msg": "skip (already desired)", "current": ("ISOLATED" if cur_isolated else "CROSSED")}
+
+    # If position or opens exist, changing margin type is often blocked (or pointless)
+    if (pos_amt is not None and abs(pos_amt) > 0.0) or has_open_orders(symbol):
+        log_json("margin_type_skip_busy", symbol=symbol, pos_amt=pos_amt)
+        return {"msg": "skip (position or open orders present)"}
+
+    # Try to change margin type (best-effort)
+    params = {"symbol": symbol, "marginType": target.upper()}
+    r = signed_post("/fapi/v1/marginType", params)
+    if r.status_code == 200:
+        return {"msg": "OK"}
+    j = _safe_json(r)
+    code = j.get("code") if isinstance(j, dict) else None
+    if code == -4046:  # "No need to change margin type."
+        return {"msg": "No need to change margin type."}
+    if code == -1000:  # testnet flake → log + continue without failing pipeline
+        log_json("margin_type_internal_nonfatal", symbol=symbol, resp=j)
+        return {"msg": "non-fatal (-1000) on marginType", "binance": j}
+    # Anything else → raise with diagnosis
+    _raise_with_diagnosis("marginType", r, extra={"symbol": symbol, "margin_type": target})
+
 def get_exchange_filters(symbol: str) -> Tuple[float, float]:
     r = rget("/fapi/v1/exchangeInfo"); r.raise_for_status()
     sym = next(s for s in r.json()["symbols"] if s["symbol"] == symbol)
@@ -466,8 +542,12 @@ async def webhook(request: Request):
         step, min_qty = FILTERS_CACHE[symbol]
 
     # Margin & leverage (idempotent)
-    try: set_margin_type(symbol, margin_type)
-    except Exception as e: log_json("set_margin_type_nonfatal", err=str(e))
+    # try: set_margin_type(symbol, margin_type)
+    # except Exception as e: log_json("set_margin_type_nonfatal", err=str(e))
+    # set_leverage(symbol, leverage)
+    # Margin & leverage (idempotent, smarter)
+    mt_result = set_margin_type_safe(symbol, margin_type)
+    log_json("margin_type_result", symbol=symbol, result=mt_result)
     set_leverage(symbol, leverage)
 
     # Size
