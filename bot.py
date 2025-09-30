@@ -25,27 +25,24 @@ COOLDOWN_SEC   = int(os.getenv("COOLDOWN_SEC", "60"))
 BASE           = os.getenv("BINANCE_BASE", "https://testnet.binancefuture.com")
 TIMEOUT_SEC    = int(os.getenv("TIMEOUT_SEC", "10"))
 MAX_RETRIES    = int(os.getenv("MAX_RETRIES", "6"))
-DEFAULT_RECV_WINDOW = int(os.getenv("RECV_WINDOW_MS", "5000"))  # 5s helps reduce -1000 on testnet
+# Testnet + CF + Render often need a wider window; default to 45s (can override via env).
+DEFAULT_RECV_WINDOW = int(os.getenv("RECV_WINDOW_MS", "45000"))
 
 # ---------- Logging (JSON) ----------
 logger = logging.getLogger("bot")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-formatter = logging.Formatter('%(message)s')  # already JSON
-handler.setFormatter(formatter)
+handler.setFormatter(logging.Formatter('%(message)s'))
 if not logger.handlers:
     logger.addHandler(handler)
 
+REQ_ID: contextvars.ContextVar[str] = contextvars.ContextVar("req_id", default="-")
+
 def log_json(event: str, **kv):
     try:
-        kv2 = {"event": event, "ts": int(time.time()*1000), "req_id": REQ_ID.get("-"), **kv}
-        logger.info(json.dumps(kv2, ensure_ascii=False))
+        logger.info(json.dumps({"event": event, "ts": int(time.time()*1000), "req_id": REQ_ID.get("-"), **kv}, ensure_ascii=False))
     except Exception:
-        # last resort
         print(f"[LOG_FAIL] {event}: {kv}")
-
-# Per-request correlation id
-REQ_ID: contextvars.ContextVar[str] = contextvars.ContextVar("req_id", default="-")
 
 # ---------- HTTP Session w/ retries ----------
 SESSION = requests.Session()
@@ -60,28 +57,35 @@ adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
 SESSION.mount("https://", adapter)
 SESSION.mount("http://", adapter)
 
-def rget(path, **kw):
-    kw.setdefault("timeout", TIMEOUT_SEC)
-    return SESSION.get(f"{BASE}{path}", **kw)
-
-def rpost(path, **kw):
-    kw.setdefault("timeout", TIMEOUT_SEC)
-    return SESSION.post(f"{BASE}{path}", **kw)
+def rget(path, **kw): kw.setdefault("timeout", TIMEOUT_SEC); return SESSION.get(f"{BASE}{path}", **kw)
+def rpost(path, **kw): kw.setdefault("timeout", TIMEOUT_SEC); return SESSION.post(f"{BASE}{path}", **kw)
 
 def sign_qs(params: Dict[str, Any]) -> str:
     qs  = urllib.parse.urlencode(params, doseq=True)
     sig = hmac.new(API_SECRET, qs.encode(), hashlib.sha256).hexdigest()
     return f"{qs}&signature={sig}"
 
+def _headers_form(): return {"X-MBX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+def _headers_json(): return {"X-MBX-APIKEY": API_KEY, "Content-Type": "application/json"}
+
+def _mbx_header_snapshot(h: Dict[str, str]) -> Dict[str, str]:
+    keys = ["x-mbx-used-weight-1m", "x-mbx-order-count-10s", "x-mbx-order-count-1m", "x-mbx-order-count-1d", "date", "server"]
+    out = {}
+    for k in keys:
+        v = h.get(k) or h.get(k.title()) or h.get(k.upper())
+        if v: out[k] = v
+    return out
+
+def _safe_json(r: requests.Response):
+    try: return r.json()
+    except Exception: return {"raw": (r.text[:500] if r.text else ""), "parse_error": True}
+
 # ---------- Time sync ----------
 TIME_OFFSET_MS = 0
-
-def local_ms() -> int:
-    return int(time.time() * 1000)
+def local_ms() -> int: return int(time.time() * 1000)
 
 def binance_server_time_ms() -> int:
-    r = rget("/fapi/v1/time")
-    r.raise_for_status()
+    r = rget("/fapi/v1/time"); r.raise_for_status()
     return int(r.json()["serverTime"])
 
 def sync_time():
@@ -93,37 +97,14 @@ def sync_time():
     except Exception as e:
         log_json("time_sync_fail", err=str(e))
 
-def now_ms_server() -> int:
-    return local_ms() + TIME_OFFSET_MS
+def now_ms_server() -> int: return local_ms() + TIME_OFFSET_MS
 
-def _headers_form():
-    return {"X-MBX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-
-def _headers_json():
-    return {"X-MBX-APIKEY": API_KEY, "Content-Type": "application/json"}
-
-def _mbx_header_snapshot(h: Dict[str, str]) -> Dict[str, str]:
-    # Pick interesting headers only
-    keys = [
-        "x-mbx-used-weight-1m", "x-mbx-order-count-10s", "x-mbx-order-count-1m",
-        "x-mbx-order-count-1d", "date", "server"
-    ]
-    out = {}
-    for k in keys:
-        v = h.get(k) or h.get(k.title()) or h.get(k.upper())
-        if v: out[k] = v
-    return out
-
-def _safe_json(r: requests.Response):
-    try:
-        return r.json()
-    except Exception:
-        return {"raw": (r.text[:500] if r.text else ""), "parse_error": True}
-
-# ---------- Signed helpers with rich logging ----------
+# ---------- Signed helpers w/ escalations ----------
 def _attach_common(params: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(params)
-    p["timestamp"] = now_ms_server()
+    # Prefer server clock; fallback to local+offset
+    try: p["timestamp"] = binance_server_time_ms()
+    except Exception: p["timestamp"] = now_ms_server()
     p.setdefault("recvWindow", DEFAULT_RECV_WINDOW)
     return p
 
@@ -133,53 +114,54 @@ def signed_get(path: str, params: Dict[str, Any]) -> requests.Response:
     log_json("http_signed_get", path=path, params=p)
     r = rget(full, headers={"X-MBX-APIKEY": API_KEY})
     j = _safe_json(r)
-    if isinstance(j, dict) and j.get("code") in (-1021, -1000):
-        log_json("http_signed_get_retry", path=path, code=j.get("code"), msg=j.get("msg"))
-        sync_time()
-        p = _attach_common(params)
-        full = f"{path}?{sign_qs(p)}"
-        r = rget(full, headers={"X-MBX-APIKEY": API_KEY})
-        j = _safe_json(r)
+    if r.status_code in (400, 401) and isinstance(j, dict) and j.get("code") in (-1021, -1000):
+        # Escalate recvWindow + resync + server timestamp
+        log_json("http_signed_get_retry", path=path, status=r.status_code, code=j.get("code"), msg=j.get("msg"))
+        time.sleep(0.25); sync_time()
+        p2 = _attach_common(params); p2["recvWindow"] = max(DEFAULT_RECV_WINDOW, 45000)
+        full2 = f"{path}?{sign_qs(p2)}"
+        r = rget(full2, headers={"X-MBX-APIKEY": API_KEY}); j = _safe_json(r)
     log_json("http_signed_get_done", path=path, status=r.status_code, code=(j.get("code") if isinstance(j, dict) else None), msg=(j.get("msg") if isinstance(j, dict) else None))
     return r
 
 def signed_post(path: str, params: Dict[str, Any]) -> requests.Response:
     """
-    Try BODY first (form-encoded), then fall back to QUERY once on -1000/-1021.
+    Body-first (form), then query; escalate on -1021 with server time + 45s recvWindow.
     """
+    # Attempt 1: BODY
     p = _attach_common(params)
     qs = sign_qs(p)
-
-    # Attempt 1: BODY
     log_json("http_signed_post", mode="body", path=path, params=p)
-    r = rpost(path, headers=_headers_form(), data=qs)
-    j = _safe_json(r)
-    if r.status_code in (400, 401, 500) and isinstance(j, dict) and j.get("code") in (-1021, -1000):
-        log_json("http_signed_post_retry", mode="query", path=path, status=r.status_code, code=j.get("code"), msg=j.get("msg"))
-        time.sleep(0.35)
-        sync_time()
-        # Attempt 2: QUERY
-        p = _attach_common(params)
-        full = f"{path}?{sign_qs(p)}"
-        r = rpost(full, headers={"X-MBX-APIKEY": API_KEY})
-        j = _safe_json(r)
+    r = rpost(path, headers=_headers_form(), data=qs); j = _safe_json(r)
 
-    log_json(
-        "http_signed_post_done",
-        path=path, status=r.status_code,
-        code=(j.get("code") if isinstance(j, dict) else None),
-        msg=(j.get("msg") if isinstance(j, dict) else None),
-        headers=_mbx_header_snapshot(r.headers)
-    )
+    if r.status_code in (400, 401, 500) and isinstance(j, dict) and j.get("code") in (-1021, -1000):
+        # Attempt 2: QUERY (basic flip)
+        log_json("http_signed_post_retry", mode="query", path=path, status=r.status_code, code=j.get("code"), msg=j.get("msg"))
+        time.sleep(0.35); sync_time()
+        p2 = _attach_common(params)
+        r = rpost(f"{path}?{sign_qs(p2)}", headers={"X-MBX-APIKEY": API_KEY}); j = _safe_json(r)
+
+    if r.status_code in (400, 401) and isinstance(j, dict) and j.get("code") == -1021:
+        # Attempt 3: escalate recvWindow + enforce server ts, try body then query
+        log_json("recv_window_escalate", prev_recv=DEFAULT_RECV_WINDOW)
+        time.sleep(0.25); sync_time()
+        p3 = _attach_common(params); p3["recvWindow"] = max(DEFAULT_RECV_WINDOW, 45000)
+        r = rpost(path, headers=_headers_form(), data=sign_qs(p3)); j = _safe_json(r)
+        if r.status_code in (400, 401) and isinstance(j, dict) and j.get("code") == -1021:
+            r = rpost(f"{path}?{sign_qs(p3)}", headers={"X-MBX-APIKEY": API_KEY}); j = _safe_json(r)
+
+    log_json("http_signed_post_done", path=path, status=r.status_code,
+             code=(j.get("code") if isinstance(j, dict) else None),
+             msg=(j.get("msg") if isinstance(j, dict) else None),
+             headers=_mbx_header_snapshot(r.headers))
     return r
 
-# Initial sync
+# Initial sync on import
 sync_time()
 
 # ---------- Binance helpers ----------
 def get_exchange_filters(symbol: str) -> Tuple[float, float]:
-    r = rget("/fapi/v1/exchangeInfo")
-    r.raise_for_status()
+    r = rget("/fapi/v1/exchangeInfo"); r.raise_for_status()
     sym = next(s for s in r.json()["symbols"] if s["symbol"] == symbol)
     lot = next(f for f in sym["filters"] if f["filterType"] in ("MARKET_LOT_SIZE", "LOT_SIZE"))
     return float(lot["stepSize"]), float(lot["minQty"])
@@ -190,8 +172,7 @@ def snap_qty(qty: float, step: float, min_qty: float) -> str:
     return s if s else "0"
 
 def get_mark_price(symbol: str) -> float:
-    r = rget("/fapi/v1/premiumIndex", params={"symbol": symbol})
-    r.raise_for_status()
+    r = rget("/fapi/v1/premiumIndex", params={"symbol": symbol}); r.raise_for_status()
     return float(r.json()["markPrice"])
 
 def is_hedge_mode() -> bool:
@@ -200,29 +181,23 @@ def is_hedge_mode() -> bool:
         log_json("hedge_mode_read_fail", status=r.status_code, body=r.text[:300])
         return False
     try:
-        data = r.json()
-        return bool(data.get("dualSidePosition", False))
+        return bool(r.json().get("dualSidePosition", False))
     except Exception as e:
         log_json("hedge_mode_parse_fail", err=str(e), body=r.text[:300])
         return False
 
 def get_account_overview() -> Dict[str, Any]:
-    r = signed_get("/fapi/v2/account", {})
-    return _safe_json(r)
+    r = signed_get("/fapi/v2/account", {}); return _safe_json(r)
 
 def get_leverage_brackets(symbol: str) -> Any:
-    r = signed_get("/fapi/v1/leverageBracket", {"symbol": symbol})
-    return _safe_json(r)
+    r = signed_get("/fapi/v1/leverageBracket", {"symbol": symbol}); return _safe_json(r)
 
 def get_current_leverage(symbol: str) -> Optional[int]:
     r = signed_get("/fapi/v2/positionRisk", {"symbol": symbol})
-    if r.status_code != 200:
-        log_json("lev_read_fail", status=r.status_code, body=r.text[:300])
-        return None
+    if r.status_code != 200: log_json("lev_read_fail", status=r.status_code, body=r.text[:300]); return None
     try:
         data = r.json()
-        if isinstance(data, list) and data:
-            return int(float(data[0].get("leverage", "0")))
+        if isinstance(data, list) and data: return int(float(data[0].get("leverage", "0")))
     except Exception as e:
         log_json("lev_read_parse_fail", err=str(e))
     return None
@@ -230,113 +205,84 @@ def get_current_leverage(symbol: str) -> Optional[int]:
 def set_margin_type(symbol: str, margin_type: str):
     params = {"symbol": symbol, "marginType": margin_type}
     r = signed_post("/fapi/v1/marginType", params)
-    if r.status_code == 200:
-        return {"msg": "OK"}
+    if r.status_code == 200: return {"msg": "OK"}
     j = _safe_json(r)
-    if isinstance(j, dict) and j.get("code") == -4046:
-        return {"msg": "No need to change margin type."}
+    if isinstance(j, dict) and j.get("code") == -4046: return {"msg": "No need to change margin type."}
     _raise_with_diagnosis("marginType", r, extra={"symbol": symbol, "margin_type": margin_type})
 
 def set_leverage(symbol: str, leverage: int):
     cur = get_current_leverage(symbol)
-    if cur == leverage:
-        return {"leverage": cur, "skipped": True}
+    if cur == leverage: return {"leverage": cur, "skipped": True}
     params = {"symbol": symbol, "leverage": leverage}
     r = signed_post("/fapi/v1/leverage", params)
-    if r.status_code == 200:
-        return _safe_json(r)
+    if r.status_code == 200: return _safe_json(r)
     j = _safe_json(r)
     if isinstance(j, dict) and j.get("code") == -1000:
         log_json("lev_retry_on_1000", symbol=symbol, leverage=leverage)
         time.sleep(0.4); sync_time()
         r2 = signed_post("/fapi/v1/leverage", params)
-        if r2.status_code == 200:
-            return _safe_json(r2)
+        if r2.status_code == 200: return _safe_json(r2)
         _raise_with_diagnosis("leverage", r2, extra={"symbol": symbol, "leverage": leverage})
     _raise_with_diagnosis("leverage", r, extra={"symbol": symbol, "leverage": leverage})
 
 def test_market_order(symbol: str, side: str, qty_str: str, position_side: Optional[str]):
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty_str}
-    if position_side:
-        params["positionSide"] = position_side
-    r = signed_post("/fapi/v1/order/test", params)
-    return r
+    if position_side: params["positionSide"] = position_side
+    return signed_post("/fapi/v1/order/test", params)
 
 def _rand_id(prefix: str = "tv") -> str:
     sfx = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(10))
     return f"{prefix}_{int(time.time()*1000)}_{sfx}"
 
 def _diagnose(symbol: str, side: str, qty_str: str, leverage: int, margin_type: str) -> Dict[str, Any]:
-    """Collects useful context to explain failures beyond Binance's message."""
-    try:
-        step, min_qty = get_exchange_filters(symbol)
-    except Exception as e:
-        step, min_qty = None, None
-
-    try:
-        mark = get_mark_price(symbol)
-    except Exception as e:
-        mark = None
-
-    try:
-        hedge = is_hedge_mode()
-    except Exception:
-        hedge = None
+    try: step, min_qty = get_exchange_filters(symbol)
+    except Exception: step, min_qty = None, None
+    try: mark = get_mark_price(symbol)
+    except Exception: mark = None
+    try: hedge = is_hedge_mode()
+    except Exception: hedge = None
 
     acct = get_account_overview()
     lev_now = get_current_leverage(symbol)
     bracket = get_leverage_brackets(symbol)
 
-    # Compute current notional
-    try:
-        notional_now = (float(qty_str) * float(mark)) if (qty_str and mark) else None
-    except Exception:
-        notional_now = None
+    try: notional_now = (float(qty_str) * float(mark)) if (qty_str and mark) else None
+    except Exception: notional_now = None
 
     suspicions: List[str] = []
-    # Heuristics to give a human hint even when Binance says -1000
     if isinstance(acct, dict) and acct.get("canTrade") is False:
         suspicions.append("Account cannot trade (canTrade=false)")
     if notional_now is not None and notional_now < 5.0:
         suspicions.append("Order notional < 5 USDT min for many symbols")
     if step and min_qty and qty_str:
         try:
-            if float(qty_str) < float(min_qty):
-                suspicions.append("Quantity below minQty")
-        except Exception:
-            pass
-    if lev_now is not None and leverage > (lev_now or 0):
-        # not always an error, but informative
-        suspicions.append(f"Requested leverage {leverage} > current {lev_now} (leveraging just changed?)")
+            if float(qty_str) < float(min_qty): suspicions.append("Quantity below minQty")
+        except Exception: pass
 
     return {
-        "symbol": symbol,
-        "side": side,
-        "requested_leverage": leverage,
-        "current_leverage": lev_now,
-        "margin_type": margin_type,
-        "hedge_mode": hedge,
-        "stepSize": step,
-        "minQty": min_qty,
-        "mark": mark,
-        "qty": qty_str,
-        "notional_now": notional_now,
+        "symbol": symbol, "side": side,
+        "requested_leverage": leverage, "current_leverage": lev_now,
+        "margin_type": margin_type, "hedge_mode": hedge,
+        "stepSize": step, "minQty": min_qty, "mark": mark,
+        "qty": qty_str, "notional_now": notional_now,
         "account_canTrade": acct.get("canTrade") if isinstance(acct, dict) else None,
         "availableBalance": acct.get("availableBalance") if isinstance(acct, dict) else None,
-        "recvWindow": DEFAULT_RECV_WINDOW,
-        "timeOffsetMs": TIME_OFFSET_MS,
-        "bracket": bracket,
-        "suspicions": suspicions,
+        "recvWindow": DEFAULT_RECV_WINDOW, "timeOffsetMs": TIME_OFFSET_MS,
+        "bracket": bracket, "suspicions": suspicions,
     }
 
 def _raise_with_diagnosis(where: str, r: requests.Response, extra: Optional[Dict[str, Any]] = None):
     j = _safe_json(r)
     diag = {}
     try:
-        if extra and "symbol" in extra:
-            # try a focused diagnosis using what we know
-            diag = _diagnose(extra.get("symbol"), extra.get("side", "?"), extra.get("qty", "0"),
-                             extra.get("leverage", 0), extra.get("margin_type", "?"))
+        if extra:
+            diag = _diagnose(
+                extra.get("symbol", "?"),
+                extra.get("side", "?"),
+                extra.get("qty", "0"),
+                extra.get("leverage", 0),
+                extra.get("margin_type", "?"),
+            )
     except Exception as e:
         diag = {"diag_error": str(e)}
 
@@ -349,42 +295,62 @@ def _raise_with_diagnosis(where: str, r: requests.Response, extra: Optional[Dict
         "req_id": REQ_ID.get("-"),
     }
     log_json("error", where=where, **payload)
-    # Return detailed JSON to client
-    raise HTTPException(status_code=500, detail=payload)
+    raise HTTPException(status_code=400 if r.status_code in (400, 401) else 500, detail=payload)
 
 def place_market_order(symbol: str, side: str, qty_str: str):
+    # Decide positionSide
     position_side = None
     try:
         if is_hedge_mode():
             position_side = "LONG" if side == "BUY" else "SHORT"
+        else:
+            position_side = "BOTH"  # explicit in one-way mode
     except Exception as e:
         log_json("hedge_mode_check_fail", err=str(e))
 
     # Preflight
-    rt = test_market_order(symbol, side, qty_str, position_side)
+    rt = test_market_order(symbol, side, qty_str, None if position_side == "BOTH" else position_side)
     log_json("order_test_resp", status=rt.status_code, body=_safe_json(rt))
     if rt.status_code not in (200, 201):
-        _raise_with_diagnosis("order_test", rt, extra={"symbol": symbol, "side": side, "qty": qty_str})
+        _raise_with_diagnosis("order_test", rt, extra={"symbol": symbol, "side": side, "qty": qty_str, "leverage": 0, "margin_type": "?"})
 
-    # Real order
-    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty_str,
-              "newClientOrderId": _rand_id("tv")}
-    if position_side:
+    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty_str, "newClientOrderId": _rand_id("tv")}
+    if position_side and position_side != "BOTH":
         params["positionSide"] = position_side
 
-    r = signed_post("/fapi/v1/order", params)
-    if r.status_code != 200:
-        # One final tolerant retry for -1000 with resync
+    # Up to 3 attempts: alternate body/query; resync & backoff on -1000/-1021
+    attempt = 0
+    last_r = None
+    while attempt < 3:
+        attempt += 1
+        p = _attach_common(params)
+        mode = "body" if attempt % 2 == 1 else "query"
+        log_json("order_attempt", attempt=attempt, mode=mode, params=p)
+
+        if mode == "body":
+            r = rpost("/fapi/v1/order", headers=_headers_form(), data=sign_qs(p))
+        else:
+            r = rpost(f"/fapi/v1/order?{sign_qs(p)}", headers={"X-MBX-APIKEY": API_KEY})
+
         j = _safe_json(r)
-        if isinstance(j, dict) and j.get("code") == -1000:
-            log_json("order_retry_on_1000", symbol=symbol, side=side, qty=qty_str)
-            time.sleep(0.5); sync_time()
-            r2 = signed_post("/fapi/v1/order", params)
-            if r2.status_code == 200:
-                return _safe_json(r2)
-            _raise_with_diagnosis("order", r2, extra={"symbol": symbol, "side": side, "qty": qty_str})
-        _raise_with_diagnosis("order", r, extra={"symbol": symbol, "side": side, "qty": qty_str})
-    return _safe_json(r)
+        log_json("order_attempt_done", attempt=attempt, mode=mode, status=r.status_code,
+                 code=(j.get("code") if isinstance(j, dict) else None),
+                 msg=(j.get("msg") if isinstance(j, dict) else None),
+                 headers=_mbx_header_snapshot(r.headers))
+
+        if r.status_code == 200:
+            return j
+
+        code = (j.get("code") if isinstance(j, dict) else None)
+        if code not in (-1000, -1021):
+            _raise_with_diagnosis("order", r, extra={"symbol": symbol, "side": side, "qty": qty_str, "leverage": 0, "margin_type": "?"})
+
+        # backoff + resync before next try
+        time.sleep(0.35 + attempt * 0.15); sync_time()
+        last_r = r
+
+    # all attempts failed → raise with full diagnosis
+    _raise_with_diagnosis("order", last_r, extra={"symbol": symbol, "side": side, "qty": qty_str, "leverage": 0, "margin_type": "?"})
 
 # ---------- App state ----------
 FILTERS_CACHE: Dict[str, Tuple[float, float]] = {}
@@ -394,8 +360,7 @@ app = FastAPI()
 
 # ---------- Security ----------
 def verify_signature(body_bytes: bytes, header_sig: str) -> bool:
-    if not WEBHOOK_SECRET:
-        return True
+    if not WEBHOOK_SECRET: return True
     digest = hmac.new(WEBHOOK_SECRET.encode(), body_bytes, hashlib.sha256).hexdigest()
     return hmac.compare_digest(digest, header_sig or "")
 
@@ -410,18 +375,16 @@ class TradeSignal(BaseModel):
     @validator("side")
     def validate_side(cls, v):
         if v is None: return v
-        v_up = v.upper()
-        if v_up not in ("BUY", "SELL"):
-            raise ValueError("side must be BUY or SELL")
-        return v_up
+        vu = v.upper()
+        if vu not in ("BUY", "SELL"): raise ValueError("side must be BUY or SELL")
+        return vu
 
     @validator("margin_type")
     def validate_margin(cls, v):
         if v is None: return v
-        v_up = v.upper()
-        if v_up not in ("ISOLATED", "CROSSED"):
-            raise ValueError("margin_type must be ISOLATED or CROSSED")
-        return v_up
+        vu = v.upper()
+        if vu not in ("ISOLATED", "CROSSED"): raise ValueError("margin_type must be ISOLATED or CROSSED")
+        return vu
 
 # ---------- Routes ----------
 @app.get("/")
@@ -430,17 +393,13 @@ def health():
 
 @app.get("/whoami")
 def whoami():
-    tail = API_KEY[-6:] if API_KEY else ""
-    return {"api_key_tail": tail, "base": BASE}
+    return {"api_key_tail": (API_KEY[-6:] if API_KEY else ""), "base": BASE}
 
 @app.on_event("startup")
 async def _startup_sync():
     sync_time()
-    try:
-        paths = [r.path for r in app.routes]
-        log_json("routes", routes=paths)
-    except Exception:
-        pass
+    try: log_json("routes", routes=[r.path for r in app.routes])
+    except Exception: pass
 
 @app.get("/diag")
 def diag(symbol: str = "BTCUSDT", notional: float = 10.0, leverage: int = 3, margin_type: str = "ISOLATED"):
@@ -449,49 +408,32 @@ def diag(symbol: str = "BTCUSDT", notional: float = 10.0, leverage: int = 3, mar
     raw_qty = max(0.0, notional / mark)
     qty = snap_qty(raw_qty, step, min_qty)
     hedge = False
-    try:
-        hedge = is_hedge_mode()
-    except Exception as e:
-        log_json("diag_hedge_fail", err=str(e))
+    try: hedge = is_hedge_mode()
+    except Exception as e: log_json("diag_hedge_fail", err=str(e))
     return {
-        "symbol": symbol,
-        "mark": mark,
-        "stepSize": step,
-        "minQty": min_qty,
-        "notional": notional,
-        "rawQty": raw_qty,
-        "snappedQty": qty,
-        "leverage": leverage,
-        "margin_type": margin_type,
-        "hedge_mode": hedge,
-        "timeOffsetMs": TIME_OFFSET_MS,
-        "recvWindow": DEFAULT_RECV_WINDOW,
-        "base": BASE,
+        "symbol": symbol, "mark": mark, "stepSize": step, "minQty": min_qty,
+        "notional": notional, "rawQty": raw_qty, "snappedQty": qty,
+        "leverage": leverage, "margin_type": margin_type, "hedge_mode": hedge,
+        "timeOffsetMs": TIME_OFFSET_MS, "recvWindow": DEFAULT_RECV_WINDOW, "base": BASE,
     }
 
 @app.get("/account")
-def account():
-    return get_account_overview()
+def account(): return get_account_overview()
 
 @app.get("/bracket")
-def bracket(symbol: str = "BTCUSDT"):
-    return get_leverage_brackets(symbol)
+def bracket(symbol: str = "BTCUSDT"): return get_leverage_brackets(symbol)
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # Correlation id per webhook call
-    req_id = _rand_id("req")
-    REQ_ID.set(req_id)
+    req_id = _rand_id("req"); REQ_ID.set(req_id)
 
     raw_body = await request.body()
     qs_secret  = request.query_params.get("secret", "")
     header_sig = request.headers.get("X-Signature", "")
 
-    # Security
     if WEBHOOK_SECRET:
         if not (qs_secret == WEBHOOK_SECRET or verify_signature(raw_body, header_sig)):
-            log_json("auth_fail", reason="invalid_signature")
-            raise HTTPException(401, "Invalid signature")
+            log_json("auth_fail", reason="invalid_signature"); raise HTTPException(401, "Invalid signature")
 
     # Parse JSON
     try:
@@ -501,7 +443,7 @@ async def webhook(request: Request):
         log_json("webhook_parsed", parsed=parsed)
         payload = TradeSignal(**parsed)
     except Exception as e:
-        log_json("json_parse_fail", err=str(e), body=body_str if 'body_str' in locals() else "")
+        log_json("json_parse_fail", err=str(e))
         raise HTTPException(400, f"Invalid JSON payload: {e}")
 
     symbol       = (payload.symbol or DEFAULT_SYMBOL).upper()
@@ -511,9 +453,7 @@ async def webhook(request: Request):
     margin_type  = payload.margin_type or DEFAULT_MARGIN
 
     # Cooldown
-    k = (symbol, side)
-    now = time.time()
-    last = LAST_ORDER_TS.get(k, 0.0)
+    k = (symbol, side); now = time.time(); last = LAST_ORDER_TS.get(k, 0.0)
     if now - last < COOLDOWN_SEC:
         rem = int(COOLDOWN_SEC - (now - last))
         log_json("cooldown", symbol=symbol, side=side, seconds_left=rem)
@@ -521,63 +461,42 @@ async def webhook(request: Request):
 
     # Filters
     if symbol not in FILTERS_CACHE:
-        step, min_qty = get_exchange_filters(symbol)
-        FILTERS_CACHE[symbol] = (step, min_qty)
+        step, min_qty = get_exchange_filters(symbol); FILTERS_CACHE[symbol] = (step, min_qty)
     else:
         step, min_qty = FILTERS_CACHE[symbol]
 
-    # Margin & leverage
-    try:
-        set_margin_type(symbol, margin_type)
-    except Exception as e:
-        log_json("set_margin_type_nonfatal", err=str(e))
+    # Margin & leverage (idempotent)
+    try: set_margin_type(symbol, margin_type)
+    except Exception as e: log_json("set_margin_type_nonfatal", err=str(e))
     set_leverage(symbol, leverage)
 
-    # Qty sizing
+    # Size
     mark = get_mark_price(symbol)
     raw_qty = max(0.0, notional_usd / mark)
     qty = snap_qty(raw_qty, step, min_qty)
-    if qty == "0":
-        raise HTTPException(400, f"Computed quantity < minQty for {symbol}; increase notional_usd")
+    if qty == "0": raise HTTPException(400, f"Computed quantity < minQty for {symbol}; increase notional_usd")
 
-    # Enforce min notional ~ 5 USDT (common)
-    notional_now = float(qty) * mark
-    if notional_now < 5.0:
+    # Enforce ~5 USDT min notional (common)
+    if (float(qty) * mark) < 5.0:
         steps_needed = math.ceil((5.0 / mark) / step)
         qty = snap_qty(steps_needed * step, step, min_qty)
 
-    # Place
+    # Place order
     resp = place_market_order(symbol, side, qty)
     LAST_ORDER_TS[k] = now
     log_json("order_ok", symbol=symbol, side=side, qty=qty, resp=resp)
-
     return {
-        "status": "ok",
-        "symbol": symbol,
-        "side": side,
-        "margin_type": margin_type,
-        "leverage": leverage,
-        "notional_usd": notional_usd,
-        "mark": mark,
-        "qty": qty,
-        "orderId": resp.get("orderId"),
-        "executedQty": resp.get("executedQty"),
-        "req_id": req_id,
+        "status": "ok", "symbol": symbol, "side": side, "margin_type": margin_type, "leverage": leverage,
+        "notional_usd": notional_usd, "mark": mark, "qty": qty,
+        "orderId": resp.get("orderId"), "executedQty": resp.get("executedQty"), "req_id": req_id,
     }
 
-# Global error handler (optional): convert unhandled exceptions to JSON with req_id
+# Global error handler → JSON with req_id
 @app.exception_handler(Exception)
 async def _unhandled(request: Request, exc: Exception):
     req_id = REQ_ID.get("-")
     log_json("unhandled_exception", err=str(exc), tb=traceback.format_exc())
-    return JSONResponse(
-        status_code=500,
-        content={"error": "unhandled_exception", "detail": str(exc), "req_id": req_id},
-    )
-
-
-
-
+    return JSONResponse(status_code=500, content={"error": "unhandled_exception", "detail": str(exc), "req_id": req_id})
 
 
 
